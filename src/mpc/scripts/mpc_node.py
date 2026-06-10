@@ -48,7 +48,7 @@ class mpc_config:
     # ---------------------------------------------------
 
     N_IND_SEARCH: int = 20  # Search index number
-    DTK: float = 0.1  # time step [s] kinematic
+    DTK: float = 0.2  # time step [s] kinematic
     dlk: float = 0.03  # dist step [m] kinematic
     LENGTH: float = 0.58  # Length of the vehicle [m]
     WIDTH: float = 0.31  # Width of the vehicle [m]
@@ -82,14 +82,37 @@ class MPC(Node):
         #       use the MPC as a tracker (similar to pure pursuit)
         # TODO: get waypoints here
         # print("here")
-        self.waypoint_path = "/home/nvidia/Downloads/levine_centerline.csv"
         self.config = mpc_config()
+        self.declare_parameter('virtual_road_mode', True)
+        self.declare_parameter('waypoint_path', '/home/nvidia/Downloads/levine_centerline.csv')
+        self.declare_parameter('virtual_lane_width', 0.3)
+        self.declare_parameter('virtual_road_length', 5.0)
+        self.declare_parameter('virtual_reference_speed', 0.6)
+        self.declare_parameter('virtual_lane_change_delay', 2.0)
+        self.declare_parameter('control_period', 0.1)
+
+        self.virtual_road_mode = self.get_parameter('virtual_road_mode').value
+        self.waypoint_path = self.get_parameter('waypoint_path').value
+        self.virtual_lane_width = self.get_parameter('virtual_lane_width').value
+        self.virtual_road_length = self.get_parameter('virtual_road_length').value
+        self.virtual_reference_speed = self.get_parameter('virtual_reference_speed').value
+        self.virtual_lane_change_delay = self.get_parameter('virtual_lane_change_delay').value
+        self.control_period = self.get_parameter('control_period').value
+        self.virtual_road_initialized = False
+        self.virtual_origin = None
+        self.virtual_yaw = None
+        self.virtual_forward = None
+        self.virtual_left = None
+        self.virtual_start_time = None
+        self.latest_odom_msg = None
 
         
         # self.waypoint_path = "/home/bosky2001/Downloads/traj_race_cl.csv" #mincurv centerline 8ish seconds at 80% velo and no crash
         # self.waypoint_path = "/home/bosky2001/f1tenth_gym/sim_ws/src/lab-8-model-predictive-controlc-team-3/mpc/reflines/traj_race_cl_mincurv.csv"
-        self.waypoints = self.load_waypoints(self.waypoint_path)
-        self.drive_pub_ = self.create_publisher(AckermannDriveStamped, 'drive', 10)
+        self.waypoints = None
+        if not self.virtual_road_mode:
+            self.waypoints = self.load_waypoints(self.waypoint_path)
+        self.drive_pub_ = self.create_publisher(AckermannDriveStamped, '/drive', 10)
         self.drive_msg_ = AckermannDriveStamped()
 
         # False-sim, True -on car
@@ -97,11 +120,13 @@ class MPC(Node):
         if(not self.sim_real):
             self.pose_sub_ = self.create_subscription(Odometry, 'ego_racecar/odom', self.pose_callback, 1)
         else:
-            self.pose_sub_ = self.create_subscription(Odometry, '/pf/viz/inferred_pose', self.pose_callback, 1)
+            self.pose_sub_ = self.create_subscription(Odometry, '/pf/pose/odom', self.pose_callback, 1)
 
         self.ref_goal_points_ = self.create_publisher(MarkerArray, 'ref_goal_points', 1)
         self.ref_trajectory_ = self.create_publisher(Marker,'ref_trajectory', 1)
         self.opt_trajectory_ = self.create_publisher(Marker,'opt_trajectory', 1)
+        self.virtual_road_ = self.create_publisher(MarkerArray, 'virtual_road', 1)
+        self.ref_target_point_ = self.create_publisher(Marker, 'ref_target_point', 1)
         
         
         self.odelta_v = None
@@ -113,7 +138,10 @@ class MPC(Node):
         self.mpc_prob_init()
 
         # visualize goal points
-        self.ref_goal_points_data = self.viz_ref_points()
+        self.ref_goal_points_data = None
+        if not self.virtual_road_mode:
+            self.ref_goal_points_data = self.viz_ref_points()
+        self.control_timer = self.create_timer(self.control_period, self.control_callback)
 
     
     def load_waypoints(self, path):
@@ -125,25 +153,71 @@ class MPC(Node):
         self.config.dlk = points[1, 0] - points[0, 0]
         return points
 
+    def init_virtual_road(self, state):
+        self.virtual_origin = np.array([state.x, state.y], dtype=np.float64)
+        self.virtual_yaw = state.yaw
+        self.virtual_forward = np.array(
+            [math.cos(self.virtual_yaw), math.sin(self.virtual_yaw)],
+            dtype=np.float64,
+        )
+        self.virtual_left = np.array(
+            [-math.sin(self.virtual_yaw), math.cos(self.virtual_yaw)],
+            dtype=np.float64,
+        )
+        self.virtual_start_time = time.time()
+        self.virtual_road_initialized = True
+        self.get_logger().info(
+            f'Virtual road initialized at x={state.x:.2f}, y={state.y:.2f}, yaw={state.yaw:.2f}'
+        )
+
+    def virtual_point(self, s, lateral_offset):
+        point = (
+            self.virtual_origin
+            + s * self.virtual_forward
+            + lateral_offset * self.virtual_left
+        )
+        return float(point[0]), float(point[1])
+
+    def calc_virtual_ref_trajectory(self, state):
+        ref_traj = np.zeros((self.config.NXK, self.config.TK + 1))
+        current_position = np.array([state.x, state.y], dtype=np.float64)
+        current_s = float(np.dot(current_position - self.virtual_origin, self.virtual_forward))
+        current_s = max(0.0, current_s)
+        elapsed = time.time() - self.virtual_start_time
+        target_offset = 0.0
+        if elapsed >= self.virtual_lane_change_delay:
+            target_offset = self.virtual_lane_width
+
+        step_distance = max(abs(state.v), self.virtual_reference_speed, 0.1) * self.config.DTK
+        for i in range(self.config.TK + 1):
+            x, y = self.virtual_point(current_s + i * step_distance, target_offset)
+            ref_traj[0, i] = x
+            ref_traj[1, i] = y
+            ref_traj[2, i] = self.virtual_reference_speed
+            ref_traj[3, i] = self.virtual_yaw
+
+        return ref_traj
+
 
     def pose_callback(self, pose_msg):
+        self.latest_odom_msg = pose_msg
+
+    def control_callback(self):
+        if self.latest_odom_msg is None:
+            return
+
+        pose_msg = self.latest_odom_msg
         # print("hi")
         start = time.time()
         
         # TODO: extract pose from ROS msg
         #state values are correct
 
-        if(not self.sim_real):
-            x_state = pose_msg.pose.pose.position.x
-            y_state = pose_msg.pose.pose.position.y
-            curr_orien = pose_msg.pose.pose.orientation
-        
-        else:
-            x_state = pose_msg.pose.position.x
-            y_state = pose_msg.pose.position.y
-            curr_orien = pose_msg.pose.orientation
+        x_state = pose_msg.pose.pose.position.x
+        y_state = pose_msg.pose.pose.position.y
+        curr_orien = pose_msg.pose.pose.orientation
         # print(x_state, y_state)
-        vel_state = self.drive_msg_.drive.speed
+        vel_state = max(0.0, pose_msg.twist.twist.linear.x)
 
         
         q = [curr_orien.x, curr_orien.y, curr_orien.z, curr_orien.w]
@@ -151,14 +225,21 @@ class MPC(Node):
         # print("current yaw", yawp)
         vehicle_state = State(x = x_state, y = y_state, v = vel_state, yaw = yaw_state)
 
-        ref_x = self.waypoints[:, 1]
-        ref_y = self.waypoints[:, 2]
-        ref_yaw = self.waypoints[:, 3]
-        ref_v = self.waypoints[:, 5]
-        # TODO: Calculate the next reference trajectory for the next T steps
-        #       with current vehicle pose.
-        #       ref_x, ref_y, ref_yaw, ref_v are columns of self.waypoints
-        ref_path = self.calc_ref_trajectory( vehicle_state, ref_x, ref_y, ref_yaw, ref_v)
+        if self.virtual_road_mode:
+            if not self.virtual_road_initialized:
+                self.init_virtual_road(vehicle_state)
+            ref_path = self.calc_virtual_ref_trajectory(vehicle_state)
+            self.viz_virtual_road()
+            self.viz_ref_target(ref_path)
+        else:
+            ref_x = self.waypoints[:, 1]
+            ref_y = self.waypoints[:, 2]
+            ref_yaw = self.waypoints[:, 3]
+            ref_v = self.waypoints[:, 5]
+            # TODO: Calculate the next reference trajectory for the next T steps
+            #       with current vehicle pose.
+            #       ref_x, ref_y, ref_yaw, ref_v are columns of self.waypoints
+            ref_path = self.calc_ref_trajectory( vehicle_state, ref_x, ref_y, ref_yaw, ref_v)
 
         self.viz_rej_traj(ref_traj=ref_path)
         #print(ref_path.shape)
@@ -174,23 +255,29 @@ class MPC(Node):
             ov,
             state_predict,
         ) = self.linear_mpc_control(ref_path, x0, self.oa, self.odelta_v)
+
+        if self.oa is None or self.odelta_v is None:
+            self.get_logger().warn('MPC solve failed; skipping drive command.')
+            return
         
         # print("reference yaw", ref_path[2, :])
         # print("predicted yaw", oyaw)
         # print("predicted yaw2", state_predict[2, :])
         # print(state_predict.shape)
-        self.viz_opt_traj(state_predict)
+        opt_traj = np.vstack((ox, oy, ov, oyaw))
+        self.viz_opt_traj(opt_traj)
         print("Time to solve",  time.time() - start)
         print("steer output is",self.odelta_v[0] )
         # TODO: publish drive message.
-        steer_output = self.odelta_v[0]
-        speed_output = vehicle_state.v + self.oa[0] * self.config.DTK
+        steer_output = float(self.odelta_v[0])
+        speed_output = float(np.clip(vehicle_state.v + self.oa[0] * self.config.DTK, self.config.MIN_SPEED, self.config.MAX_SPEED))
 
         
         self.drive_msg_.drive.speed = speed_output
         self.drive_msg_.drive.steering_angle = steer_output
         self.drive_pub_.publish(self.drive_msg_)
-        self.ref_goal_points_.publish(self.ref_goal_points_data)
+        if self.ref_goal_points_data is not None:
+            self.ref_goal_points_.publish(self.ref_goal_points_data)
 
 
     def mpc_prob_init(self):
@@ -531,6 +618,88 @@ class MPC(Node):
         return mpc_a, mpc_delta, mpc_x, mpc_y, mpc_yaw, mpc_v, path_predict
 
     ## Visualization MPC utils
+    def viz_virtual_road(self):
+        road = MarkerArray()
+        now = self.get_clock().now().to_msg()
+        edge_specs = [
+            (-0.5 * self.virtual_lane_width, 0.9, 0.9, 0.9),
+            (0.5 * self.virtual_lane_width, 1.0, 1.0, 1.0),
+            (1.5 * self.virtual_lane_width, 0.9, 0.9, 0.9),
+        ]
+
+        for marker_id, (offset, red, green, blue) in enumerate(edge_specs):
+            line = Marker(type=Marker.LINE_STRIP, scale=Vector3(x=0.025, y=0.025, z=0.025))
+            line.header.frame_id = 'map'
+            line.header.stamp = now
+            line.ns = 'virtual_road_edges'
+            line.id = marker_id
+            line.action = Marker.ADD
+            line.pose.orientation.w = 1.0
+            line.color.a = 1.0
+            line.color.r = red
+            line.color.g = green
+            line.color.b = blue
+
+            for s in np.linspace(-0.5, self.virtual_road_length, 40):
+                x, y = self.virtual_point(s, offset)
+                line.points.append(Point(x=x, y=y, z=0.0))
+
+            road.markers.append(line)
+
+        center_specs = [
+            (0.0, 0.0, 0.9, 0.1),
+            (self.virtual_lane_width, 0.0, 0.8, 1.0),
+        ]
+        dash_length = 0.18
+        gap_length = 0.12
+        s_start = -0.5
+        s_end = self.virtual_road_length
+
+        for marker_id, (offset, red, green, blue) in enumerate(center_specs, start=10):
+            center = Marker(type=Marker.LINE_LIST, scale=Vector3(x=0.018, y=0.018, z=0.018))
+            center.header.frame_id = 'map'
+            center.header.stamp = now
+            center.ns = 'virtual_lane_centers'
+            center.id = marker_id
+            center.action = Marker.ADD
+            center.pose.orientation.w = 1.0
+            center.color.a = 1.0
+            center.color.r = red
+            center.color.g = green
+            center.color.b = blue
+
+            s = s_start
+            while s < s_end:
+                x0, y0 = self.virtual_point(s, offset)
+                x1, y1 = self.virtual_point(min(s + dash_length, s_end), offset)
+                center.points.append(Point(x=x0, y=y0, z=0.02))
+                center.points.append(Point(x=x1, y=y1, z=0.02))
+                s += dash_length + gap_length
+
+            road.markers.append(center)
+
+        self.virtual_road_.publish(road)
+
+    def viz_ref_target(self, ref_traj):
+        target = Marker(type=Marker.SPHERE)
+        target.header.frame_id = 'map'
+        target.header.stamp = self.get_clock().now().to_msg()
+        target.ns = 'ref_target'
+        target.id = 0
+        target.action = Marker.ADD
+        target.pose.orientation.w = 1.0
+        target.pose.position.x = float(ref_traj[0, -1])
+        target.pose.position.y = float(ref_traj[1, -1])
+        target.pose.position.z = 0.0
+        target.scale.x = 0.14
+        target.scale.y = 0.14
+        target.scale.z = 0.14
+        target.color.a = 1.0
+        target.color.r = 1.0
+        target.color.g = 0.55
+        target.color.b = 0.0
+        self.ref_target_point_.publish(target)
+
     def viz_ref_points(self):
         ref_points = MarkerArray()
 
