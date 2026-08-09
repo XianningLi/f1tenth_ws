@@ -23,6 +23,7 @@ from scipy.spatial.transform import Rotation
 from visualization_msgs.msg import Marker
 from visualization_msgs.msg import MarkerArray
 import time
+from mpc.run_logger import RunCsvLogger, default_log_directory
 
 @dataclass
 class mpc_config:
@@ -90,6 +91,8 @@ class MPC(Node):
         self.declare_parameter('virtual_reference_speed', 0.6)
         self.declare_parameter('virtual_lane_change_delay', 2.0)
         self.declare_parameter('control_period', 0.1)
+        self.declare_parameter('save_run_data', True)
+        self.declare_parameter('log_directory', default_log_directory())
 
         self.virtual_road_mode = self.get_parameter('virtual_road_mode').value
         self.waypoint_path = self.get_parameter('waypoint_path').value
@@ -136,6 +139,15 @@ class MPC(Node):
 
         # initialize MPC problem
         self.mpc_prob_init()
+        self.last_solver_time_ms = None
+        self.run_logger = None
+        if bool(self.get_parameter('save_run_data').value):
+            self.run_logger = RunCsvLogger(
+                self.get_parameter('log_directory').value,
+                'MPC',
+                self.config.TK,
+            )
+            self.get_logger().info(f'Run data: {self.run_logger.path}')
 
         # visualize goal points
         self.ref_goal_points_data = None
@@ -208,7 +220,7 @@ class MPC(Node):
 
         pose_msg = self.latest_odom_msg
         # print("hi")
-        start = time.time()
+        callback_start_ns = time.perf_counter_ns()
         
         # TODO: extract pose from ROS msg
         #state values are correct
@@ -246,17 +258,67 @@ class MPC(Node):
         x0 = [vehicle_state.x, vehicle_state.y, vehicle_state.v, vehicle_state.yaw]
 
         # TODO: solve the MPC control problem
-        (
-            self.oa,
-            self.odelta_v,
-            ox,
-            oy,
-            oyaw,
-            ov,
-            state_predict,
-        ) = self.linear_mpc_control(ref_path, x0, self.oa, self.odelta_v)
+        controller_start_ns = time.perf_counter_ns()
+        self.last_solver_time_ms = None
+        try:
+            (
+                self.oa,
+                self.odelta_v,
+                ox,
+                oy,
+                oyaw,
+                ov,
+                state_predict,
+            ) = self.linear_mpc_control(ref_path, x0, self.oa, self.odelta_v)
+        except Exception as exc:
+            controller_compute_ms = (
+                time.perf_counter_ns() - controller_start_ns
+            ) / 1.0e6
+            self.write_run_log(
+                status='solve_exception',
+                timings={
+                    'controller_compute_ms': controller_compute_ms,
+                    'solver_internal_ms': self.last_solver_time_ms,
+                    'control_inference_ms': None,
+                    'prediction_rollout_ms': None,
+                    'callback_total_ms': (
+                        time.perf_counter_ns() - callback_start_ns
+                    ) / 1.0e6,
+                },
+                state=np.asarray(x0, dtype=float),
+                reference=ref_path,
+                predicted_states=None,
+                predicted_controls=None,
+                command_acceleration=None,
+                command_steering=None,
+                command_speed=None,
+            )
+            self.get_logger().error(f'MPC solve raised an exception: {exc}')
+            return
+        controller_compute_ms = (
+            time.perf_counter_ns() - controller_start_ns
+        ) / 1.0e6
 
         if self.oa is None or self.odelta_v is None:
+            self.write_run_log(
+                status='solve_failed',
+                timings={
+                    'controller_compute_ms': controller_compute_ms,
+                    'solver_internal_ms': self.last_solver_time_ms,
+                    'control_inference_ms': None,
+                    'prediction_rollout_ms': None,
+                    'callback_total_ms': (
+                        time.perf_counter_ns() - callback_start_ns
+                    ) / 1.0e6,
+                },
+                state=np.asarray(x0, dtype=float),
+                reference=ref_path,
+                predicted_states=None,
+                predicted_controls=None,
+                command_acceleration=None,
+                command_steering=None,
+                command_speed=None,
+            )
             self.get_logger().warn('MPC solve failed; skipping drive command.')
             return
         
@@ -265,9 +327,8 @@ class MPC(Node):
         # print("predicted yaw2", state_predict[2, :])
         # print(state_predict.shape)
         opt_traj = np.vstack((ox, oy, ov, oyaw))
+        opt_controls = np.vstack((self.oa, self.odelta_v))
         self.viz_opt_traj(opt_traj)
-        print("Time to solve",  time.time() - start)
-        print("steer output is",self.odelta_v[0] )
         # TODO: publish drive message.
         steer_output = float(self.odelta_v[0])
         speed_output = float(np.clip(vehicle_state.v + self.oa[0] * self.config.DTK, self.config.MIN_SPEED, self.config.MAX_SPEED))
@@ -278,6 +339,49 @@ class MPC(Node):
         self.drive_pub_.publish(self.drive_msg_)
         if self.ref_goal_points_data is not None:
             self.ref_goal_points_.publish(self.ref_goal_points_data)
+        callback_total_ms = (
+            time.perf_counter_ns() - callback_start_ns
+        ) / 1.0e6
+        self.write_run_log(
+            status='ok',
+            timings={
+                'controller_compute_ms': controller_compute_ms,
+                'solver_internal_ms': self.last_solver_time_ms,
+                'control_inference_ms': None,
+                'prediction_rollout_ms': None,
+                'callback_total_ms': callback_total_ms,
+            },
+            state=np.asarray(x0, dtype=float),
+            reference=ref_path,
+            predicted_states=opt_traj,
+            predicted_controls=opt_controls,
+            command_acceleration=float(self.oa[0]),
+            command_steering=steer_output,
+            command_speed=speed_output,
+        )
+        self.get_logger().debug(
+            'MPC compute %.3f ms, solver %.3f ms, total %.3f ms: '
+            'a=%.3f m/s^2, steer=%.3f rad, speed=%.3f m/s'
+            % (
+                controller_compute_ms,
+                self.last_solver_time_ms or 0.0,
+                callback_total_ms,
+                self.oa[0],
+                steer_output,
+                speed_output,
+            )
+        )
+
+    def write_run_log(self, **sample):
+        if self.run_logger is None:
+            return
+        try:
+            sample['ros_time_sec'] = self.get_clock().now().nanoseconds / 1.0e9
+            self.run_logger.log(**sample)
+        except Exception as exc:
+            self.get_logger().error(f'Disabling run data logging after error: {exc}')
+            self.run_logger.close()
+            self.run_logger = None
 
 
     def mpc_prob_init(self):
@@ -573,8 +677,12 @@ class MPC(Node):
 
         # Solve the optimization problem in CVXPY
         # Solver selections: cvxpy.OSQP; cvxpy.GUROBI
+        self.last_solver_time_ms = None
         self.MPC_prob.solve(solver=cvxpy.OSQP, verbose=False, warm_start=True)
-        print("MPC solve time:", self.MPC_prob.solver_stats.solve_time)
+        if self.MPC_prob.solver_stats.solve_time is not None:
+            self.last_solver_time_ms = (
+                float(self.MPC_prob.solver_stats.solve_time) * 1000.0
+            )
 
         if (
             self.MPC_prob.status == cvxpy.OPTIMAL
@@ -758,6 +866,11 @@ class MPC(Node):
             # print(f'Publishing ref traj x={x}, y={y}')
             traj.points.append(Point(x=x, y=y, z=0.0))
         self.opt_trajectory_.publish(traj)
+
+    def destroy_node(self):
+        if self.run_logger is not None:
+            self.run_logger.close()
+        return super().destroy_node()
 
 
 
