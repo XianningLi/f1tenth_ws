@@ -27,32 +27,40 @@ def make_warmup_inputs(horizon, model_dt, speed):
 
 @dataclass
 class StartupGate:
-    """Apply a bounded breakaway boost, then settle at the experiment speed."""
+    """Boost until target speed, then settle; duration limits are opt-in."""
 
     target_speed: float
     acceleration: float = 0.5
     tolerance: float = 0.05
-    stable_duration: float = 2.0
-    startup_timeout: float = 15.0
+    stable_duration: float = 1.0
+    startup_timeout: float = 0.0
     max_step_time: float = 0.2
     boost_speed: float = 1.0
-    boost_duration: float = 1.0
+    boost_duration: float = 0.0
 
     def __post_init__(self):
         values = (
             self.target_speed, self.acceleration, self.tolerance,
-            self.stable_duration, self.startup_timeout, self.max_step_time,
-            self.boost_duration,
+            self.stable_duration, self.max_step_time,
         )
         if not all(math.isfinite(value) and value > 0.0 for value in values):
             raise ValueError("Startup parameters must be finite and positive")
+        if not all(
+            math.isfinite(value) and value >= 0.0
+            for value in (self.startup_timeout, self.boost_duration)
+        ):
+            raise ValueError("Startup duration limits must be finite and nonnegative; 0 disables")
         if not math.isfinite(self.boost_speed) or self.boost_speed < 0.0:
             raise ValueError("startup_boost_speed must be finite and nonnegative")
-        if self.boost_speed > 0.0 and self.boost_duration >= self.startup_timeout:
+        if (
+            self.boost_speed > 0.0 and self.boost_duration > 0.0
+            and self.startup_timeout > 0.0
+            and self.boost_duration >= self.startup_timeout
+        ):
             raise ValueError("startup_boost_duration must be shorter than startup_timeout")
         if self.tolerance >= self.target_speed:
             raise ValueError("startup_speed_tolerance must be smaller than startup_speed")
-        if self.startup_timeout <= self.stable_duration:
+        if 0.0 < self.startup_timeout <= self.stable_duration:
             raise ValueError("startup_timeout must exceed startup_stable_duration")
         self.reset()
 
@@ -94,7 +102,7 @@ class StartupGate:
             ):
                 self.phase = "BOOSTING"
                 self.boost_started_at = now
-        if now - self.started_at >= self.startup_timeout:
+        if self.startup_timeout > 0.0 and now - self.started_at >= self.startup_timeout:
             self.abort("startup_timeout")
             return 0.0
 
@@ -104,7 +112,7 @@ class StartupGate:
                 self.command_speed = self.target_speed
                 self.last_tick = now
                 self.phase = "STARTUP"
-            elif now - self.boost_started_at >= self.boost_duration:
+            elif self.boost_duration > 0.0 and now - self.boost_started_at >= self.boost_duration:
                 self.abort("startup_boost_timeout")
                 return 0.0
             else:
@@ -147,10 +155,10 @@ class ExperimentNodeMixin:
             "startup_speed": -1.0,
             "startup_acceleration": 0.5,
             "startup_speed_tolerance": 0.05,
-            "startup_stable_duration": 2.0,
-            "startup_timeout": 15.0,
+            "startup_stable_duration": 1.0,
+            "startup_timeout": 0.0,
             "startup_boost_speed": 1.0,
-            "startup_boost_duration": 1.0,
+            "startup_boost_duration": 0.0,
             "joy_timeout": 0.3,
             "odometry_timeout": 0.3,
         }
@@ -213,12 +221,18 @@ class ExperimentNodeMixin:
             "with the first published controller command."
             % (target, self.startup_gate.tolerance, self.startup_gate.stable_duration)
         )
+        boost_limit = (
+            "%.2f s" % self.startup_gate.boost_duration
+            if self.startup_gate.boost_duration > 0.0 else "disabled"
+        )
+        startup_limit = (
+            "%.2f s" % self.startup_gate.startup_timeout
+            if self.startup_gate.startup_timeout > 0.0 else "disabled"
+        )
         self.get_logger().info(
-            "Startup boost: %.3f m/s until measured speed reaches target %.3f m/s "
-            "(at most %.2f s). Set startup_boost_speed=0 to disable."
-            % (
-                self.startup_gate.boost_speed, target, self.startup_gate.boost_duration,
-            )
+            "Startup boost: %.3f m/s until measured speed reaches target %.3f m/s. "
+            "Boost duration limit: %s; total startup limit: %s. Hold RB throughout."
+            % (self.startup_gate.boost_speed, target, boost_limit, startup_limit)
         )
 
     def experiment_joy_callback(self, message):

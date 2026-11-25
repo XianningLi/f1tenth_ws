@@ -16,10 +16,10 @@ def generate_launch_description():
         'startup_speed': '-1.0',
         'startup_acceleration': '0.5',
         'startup_speed_tolerance': '0.05',
-        'startup_stable_duration': '2.0',
-        'startup_timeout': '15.0',
+        'startup_stable_duration': '1.0',
+        'startup_timeout': '0.0',
         'startup_boost_speed': '1.0',
-        'startup_boost_duration': '1.0',
+        'startup_boost_duration': '0.0',
         'joy_timeout': '0.3',
         'odometry_timeout': '0.3',
     }

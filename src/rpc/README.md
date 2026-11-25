@@ -19,16 +19,20 @@ CVXPY/OSQP 求解替换为训练好的 RPC/HFRPC 网络。网络每次输出一�
 
 On launch, the node first runs three synthetic inference/rollout passes without
 creating a real scene, publishing drive commands, or recording experiment data.
-After warmup, hold RB to start vehicle startup. A car below its startup target gets a bounded
+After warmup, hold RB to start vehicle startup. A car below its startup target gets a
 1.0 m/s breakaway command (matching full-forward joystick input), until measured
-speed reaches the startup target (0.6 m/s by default) or the one-second boost
-timeout expires. On reaching the target, the command immediately returns to
-that speed and the two-second settling check begins. A boost timeout stops the
-car and requires releasing RB before retrying. A car already at or above the target
+speed reaches the startup target (0.6 m/s by default), with no default duration
+cutoff. On reaching the target, the command immediately returns to that speed
+and the one-second settling check begins. A car already at or above the target
 uses the normal speed ramp; boost is also skipped when its command is no higher
 than the startup target. Set `startup_boost_speed:=0.0` to disable the boost.
+`startup_boost_duration` and `startup_timeout` both default to 0.0 (disabled).
+Positive values enable optional duration cutoffs. RB release, LB takeover,
+and feedback timeouts still stop the autonomous command. A manual run-up is
+supported: hold LB through node startup, then release LB and hold RB. The node
+still waits for the requested initial speed to settle before creating a scene.
 The default startup speed follows `virtual_reference_speed`. Once the command
-reaches that target and measured speed remains within +/-0.05 m/s for 2.0
+reaches that target and measured speed remains within +/-0.05 m/s for 1.0
 consecutive seconds, the node creates the virtual road at the current vehicle
 pose and calculates its first controller command. The experiment clock starts
 only when that first command is successfully published. Its first CSV row has
@@ -44,7 +48,7 @@ subscribes to `/joy` as well as `/pf/pose/odom`.
 ```bash
 ros2 launch rpc rpc_launch.py \
   virtual_reference_speed:=1.0 \
-  startup_stable_duration:=2.0
+  startup_stable_duration:=1.0
 ```
 
 Set `startup_speed` separately if the scenario initial speed should differ

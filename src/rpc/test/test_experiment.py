@@ -36,14 +36,14 @@ def test_boost_matches_full_forward_command_then_returns_to_target(experiment):
     assert gate.stable_since is None
     gate.update(0.4, 0.6, True, True)
     assert gate.phase == "STABILIZING"
-    gate.update(2.39, 0.6, True, True)
+    gate.update(1.39, 0.6, True, True)
     assert gate.phase == "STABILIZING"
-    assert gate.update(2.41, 0.6, True, True) is None
+    assert gate.update(1.41, 0.6, True, True) is None
     assert gate.phase == "PREPARING"
 
 
 def test_boost_timeout_stops_and_does_not_retry_while_rb_is_held(experiment):
-    gate = experiment.StartupGate(target_speed=0.6)
+    gate = experiment.StartupGate(target_speed=0.6, boost_duration=1.0)
     gate.update(0.0, 0.0, True, True)
     assert gate.update(0.99, 0.0, True, True) == 1.0
     assert gate.update(1.0, 0.0, True, True) == 0.0
@@ -89,13 +89,13 @@ def test_boost_is_not_repeated_when_speed_drops_after_breakaway(experiment):
     assert gate.phase == "STARTUP"
 
 
-def test_requires_two_full_seconds_of_measured_speed_stability(experiment):
+def test_requires_one_full_second_of_measured_speed_stability(experiment):
     gate = experiment.StartupGate(target_speed=0.6)
     gate.update(0.0, 0.6, True, True)
     assert gate.phase == "STABILIZING"
-    gate.update(1.99, 0.6, True, True)
+    gate.update(0.99, 0.6, True, True)
     assert gate.phase == "STABILIZING"
-    assert gate.update(2.0, 0.6, True, True) is None
+    assert gate.update(1.0, 0.6, True, True) is None
     assert gate.phase == "PREPARING"
 
 
@@ -111,9 +111,9 @@ def test_speed_outside_tolerance_restarts_stability_timer(experiment):
     gate.update(1.0, 0.7, True, True)
     assert gate.stable_since is None
     gate.update(1.1, 0.6, True, True)
-    gate.update(3.09, 0.6, True, True)
+    gate.update(2.09, 0.6, True, True)
     assert gate.phase == "STABILIZING"
-    gate.update(3.11, 0.6, True, True)
+    gate.update(2.11, 0.6, True, True)
     assert gate.phase == "PREPARING"
 
 
@@ -236,11 +236,11 @@ def node(experiment, tmp_path, monkeypatch):
 def test_scenario_and_csv_start_only_after_settling_and_restart_per_hold(node, tmp_path):
     assert not node.tick(0.0, rb=False)
     assert not node.tick(0.1)
-    assert not node.tick(2.09)
+    assert not node.tick(1.09)
     assert not node.scenarios
     assert not list(tmp_path.glob("*.csv"))
-    assert node.tick(2.11)
-    np.testing.assert_allclose(node.scenarios[0], [2.11, 2.0, 0.6, 0.4])
+    assert node.tick(1.11)
+    np.testing.assert_allclose(node.scenarios[0], [1.11, 2.0, 0.6, 0.4])
     assert node.experiment_start_time is None
     assert node.run_logger is None
     assert not list(tmp_path.glob("*.csv"))
@@ -249,10 +249,10 @@ def test_scenario_and_csv_start_only_after_settling_and_restart_per_hold(node, t
     assert node.experiment_sample_time == 0.0
     node.write_sample()
     first_logger = node.run_logger
-    assert node.tick(2.21)
+    assert node.tick(1.21)
     assert node.publish_valid_command()
     node.write_sample()
-    node.tick(2.3, rb=False)
+    node.tick(1.3, rb=False)
     assert first_logger._file.closed
     with first_logger.path.open(newline="") as stream:
         rows = list(csv.DictReader(stream))
@@ -260,8 +260,8 @@ def test_scenario_and_csv_start_only_after_settling_and_restart_per_hold(node, t
     assert rows[0]["phase"] == "RUNNING"
     assert float(rows[0]["experiment_time_sec"]) == 0.0
     assert float(rows[1]["experiment_time_sec"]) == pytest.approx(0.1)
-    assert not node.tick(2.4)
-    assert node.tick(4.41)
+    assert not node.tick(1.4)
+    assert node.tick(2.41)
     assert len(node.scenarios) == 2
     assert node.publish_valid_command()
     node.write_sample()
@@ -279,10 +279,10 @@ def test_boost_and_return_to_target_are_excluded_from_the_experiment(node, tmp_p
     assert node.startup_gate.phase == "BOOSTING"
     assert not node.tick(0.2, speed=0.6)
     assert node.startup_gate.phase == "STABILIZING"
-    assert not node.tick(2.19, speed=0.6)
+    assert not node.tick(1.19, speed=0.6)
     assert not node.scenarios
     assert not list(tmp_path.glob("*.csv"))
-    assert node.tick(2.21, speed=0.6)
+    assert node.tick(1.21, speed=0.6)
     assert node.experiment_start_time is None
     assert node.publish_valid_command()
     node.write_sample()
@@ -302,10 +302,10 @@ def test_boost_and_settling_are_excluded_from_scene_and_experiment_log(node, tmp
     assert node.commands[-1] == (1.0, 0.0)
     assert node.startup_gate.phase == "BOOSTING"
     assert not node.tick(0.3, speed=0.6)
-    assert not node.tick(2.29, speed=0.6)
+    assert not node.tick(1.29, speed=0.6)
     assert not node.scenarios
     assert not list(tmp_path.glob("*.csv"))
-    assert node.tick(2.31, speed=0.6)
+    assert node.tick(1.31, speed=0.6)
     assert len(node.scenarios) == 1
     assert node.experiment_start_time is None
     node.complete_scene_preparation()
@@ -319,13 +319,64 @@ def test_boost_and_settling_are_excluded_from_scene_and_experiment_log(node, tmp
     node.close_experiment()
 
 
-def test_boost_timeout_creates_no_scene_or_log(node, tmp_path):
+def test_default_boost_continues_past_old_limits_until_target_then_settles(node, tmp_path):
     node.tick(0.0, speed=0.0)
-    assert not node.tick(1.0, speed=0.0)
-    assert node.startup_gate.abort_reason == "startup_boost_timeout"
-    assert node.commands[-1] == (0.0, 0.0)
+    for now in (1.0, 5.0, 16.0, 30.0):
+        assert not node.tick(now, speed=0.1)
+        assert node.startup_gate.phase == "BOOSTING"
+        assert node.commands[-1] == (1.0, 0.0)
     assert not node.scenarios
     assert not list(tmp_path.glob("*.csv"))
+    assert not node.tick(30.1, speed=0.6)
+    assert node.commands[-1] == (0.6, 0.0)
+    assert node.startup_gate.phase == "STABILIZING"
+    assert not node.tick(31.09, speed=0.6)
+    assert node.tick(31.11, speed=0.6)
+    assert len(node.scenarios) == 1
+    assert node.experiment_start_time is None
+    assert node.publish_valid_command()
+    node.write_sample()
+    with node.run_logger.path.open(newline="") as stream:
+        first = next(csv.DictReader(stream))
+    assert first["experiment_time_sec"] == "0.0"
+    node.close_experiment()
+
+
+@pytest.mark.parametrize("manual_speed", [0.3, 0.6, 0.9])
+def test_manual_run_up_waits_for_rb_and_settles_at_target_before_scene(
+    node, tmp_path, manual_speed,
+):
+    assert not node.tick(0.0, speed=manual_speed, rb=False, lb=True)
+    assert not node.tick(1.0, speed=manual_speed, rb=True, lb=True)
+    assert node.startup_gate.phase == "WAITING"
+    assert not node.scenarios
+    assert not node.tick(1.1, speed=manual_speed, rb=True, lb=False)
+    if manual_speed < 0.6:
+        assert node.commands[-1] == (1.0, 0.0)
+        assert node.startup_gate.phase == "BOOSTING"
+    else:
+        assert node.commands[-1] == (0.6, 0.0)
+        if manual_speed > 0.6:
+            assert node.startup_gate.stable_since is None
+    node.tick(1.2, speed=0.6)
+    stable_since = node.startup_gate.stable_since
+    assert not node.tick(stable_since + 0.99, speed=0.6)
+    assert not node.scenarios
+    assert not list(tmp_path.glob("*.csv"))
+    assert node.tick(stable_since + 1.01, speed=0.6)
+    np.testing.assert_allclose(node.scenarios[0][2], 0.6)
+    assert node.experiment_start_time is None
+    assert node.publish_valid_command()
+    node.write_sample()
+    assert node.run_logger.sample_index == 1
+    node.close_experiment()
+
+
+@pytest.mark.parametrize("parameter", ["startup_timeout", "boost_duration"])
+@pytest.mark.parametrize("invalid", [-1.0, float("inf"), float("nan")])
+def test_optional_duration_limits_reject_invalid_values(experiment, parameter, invalid):
+    with pytest.raises(ValueError, match="duration limits"):
+        experiment.StartupGate(target_speed=0.6, **{parameter: invalid})
 
 
 def test_boost_speed_cannot_exceed_the_vehicle_limit(node):
@@ -588,12 +639,12 @@ def test_real_controller_callbacks_gate_scene_solve_and_csv(node, experiment, tm
 
     cycle(0.0, 0.0, rb=False)
     cycle(0.1, 1.0)
-    cycle(2.09, 9.0)
+    cycle(1.09, 9.0)
     assert node.virtual_origin is None
     assert not backend_calls
     assert not list(tmp_path.glob("*.csv"))
 
-    cycle(2.11, 10.0)
+    cycle(1.11, 10.0)
     np.testing.assert_allclose(node.virtual_origin, [10.0, 20.0])
     assert node.virtual_yaw == pytest.approx(0.4)
     assert backend_calls
