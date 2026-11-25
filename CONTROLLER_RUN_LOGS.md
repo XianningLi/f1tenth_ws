@@ -24,9 +24,13 @@ published controller command, after computational warmup and vehicle startup.
    Only one boost is issued per RB hold. If already at or above the target, with boost disabled,
    or with a startup target at least as high as the boost, use the normal
    `STARTUP` speed ramp at `startup_acceleration` instead. Steering remains zero.
-3. Once the command reaches the target and measured speed stays within
-   `startup_speed_tolerance` of it, enter `STABILIZING`. Any excursion outside
-   the tolerance resets the entire settling timer.
+3. Once the command is at the target and measured speed reaches or exceeds it,
+   enter `STABILIZING` and start the hold timer. Speed fluctuations no longer
+   reset this timer. Only measured speed at or below
+   `startup_zero_speed_threshold` (0.1 m/s by default) clears the timer while
+   autonomous enable and fresh feedback remain valid. After a near-stop, wait
+   for measured speed to reach the target again before restarting the timer.
+   RB release, LB takeover, and feedback loss still cancel the startup process.
 4. After 1.0 consecutive second by default, enter `PREPARING`. Capture the
    vehicle's current position and heading as the real virtual-road origin,
    construct its first reference trajectory, and calculate the first command.
@@ -79,9 +83,12 @@ resets the program's startup/settling state.
 At RB handover, the measured speed determines the next action. With the default
 0.6 m/s initial speed, a lower speed receives the 1.0 m/s boost until it reaches
 0.6 m/s. A speed already at the target starts the settling check. A higher speed
-gets a 0.6 m/s command and must slow into the target tolerance before settling.
-Every case requires 1.0 consecutive second within +/-0.05 m/s of the initial
-speed before the scene is generated from that later pose. Manual driving,
+gets a 0.6 m/s command and can start the hold timer immediately because the
+target has already been reached or exceeded. After initially reaching the
+target, every case requires 1.0 second of continued forward motion above
+0.1 m/s before scene creation. The actual initial speed can differ from the
+requested startup speed; the first CSV state records that measured value.
+This replaces the previous +/-0.05 m/s speed-error tolerance rule. Manual driving,
 warmup, and settling do not create scene data or start the experiment clock.
 
 Fresh joystick and odometry messages are required. Losing either stream for
@@ -185,8 +192,8 @@ Both launch files expose the same startup parameters:
 | `startup_acceleration` | `0.5` | Speed-command ramp rate in m/s^2 |
 | `startup_boost_speed` | `1.0` | Breakaway speed command in m/s; 0 disables boost |
 | `startup_boost_duration` | `0.0` | Optional boost duration limit in s; 0 disables |
-| `startup_speed_tolerance` | `0.05` | Allowed measured-speed error in m/s |
-| `startup_stable_duration` | `1.0` | Required uninterrupted settling time in s |
+| `startup_zero_speed_threshold` | `0.1` | Near-zero speed in m/s that resets the hold timer; must be below startup speed |
+| `startup_stable_duration` | `1.0` | Required motion-hold duration after reaching the target in s |
 | `startup_timeout` | `0.0` | Optional startup/settling duration limit in s; 0 disables |
 | `virtual_reference_speed` | `0.6` | Scenario speed target in m/s |
 | `virtual_lane_change_delay` | `2.0` | Delay from the first controller publication in s |
@@ -229,7 +236,7 @@ ros2 launch rpc rpc_launch.py \
 
 The boost continues until the measured startup target is reached while RB is
 held and feedback remains fresh. Boost does not change controller warmup, scenario generation, the
-one-second settling test, or the first-publication definition of time zero.
+one-second motion-hold test, or the first-publication definition of time zero.
 
 Use a custom output directory:
 

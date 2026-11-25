@@ -27,11 +27,11 @@ def make_warmup_inputs(horizon, model_dt, speed):
 
 @dataclass
 class StartupGate:
-    """Boost until target speed, then settle; duration limits are opt-in."""
+    """Reach target speed, then hold motion; only near-zero speed resets the timer."""
 
     target_speed: float
     acceleration: float = 0.5
-    tolerance: float = 0.05
+    zero_speed_threshold: float = 0.1
     stable_duration: float = 1.0
     startup_timeout: float = 0.0
     max_step_time: float = 0.2
@@ -40,7 +40,7 @@ class StartupGate:
 
     def __post_init__(self):
         values = (
-            self.target_speed, self.acceleration, self.tolerance,
+            self.target_speed, self.acceleration,
             self.stable_duration, self.max_step_time,
         )
         if not all(math.isfinite(value) and value > 0.0 for value in values):
@@ -58,8 +58,11 @@ class StartupGate:
             and self.boost_duration >= self.startup_timeout
         ):
             raise ValueError("startup_boost_duration must be shorter than startup_timeout")
-        if self.tolerance >= self.target_speed:
-            raise ValueError("startup_speed_tolerance must be smaller than startup_speed")
+        if (
+            not math.isfinite(self.zero_speed_threshold)
+            or not 0.0 <= self.zero_speed_threshold < self.target_speed
+        ):
+            raise ValueError("startup_zero_speed_threshold must be nonnegative and below startup_speed")
         if 0.0 < self.startup_timeout <= self.stable_duration:
             raise ValueError("startup_timeout must exceed startup_stable_duration")
         self.reset()
@@ -127,16 +130,16 @@ class StartupGate:
         self.command_speed += max(-change, min(change, difference))
 
         at_command_target = abs(self.command_speed - self.target_speed) <= 1.0e-9
-        in_speed_band = abs(speed - self.target_speed) <= self.tolerance
-        if at_command_target and in_speed_band:
-            if self.stable_since is None:
-                self.stable_since = now
+        if speed <= self.zero_speed_threshold:
+            self.stable_since = None
+        elif self.stable_since is None and at_command_target and speed >= self.target_speed:
+            self.stable_since = now
+        if self.stable_since is not None:
             self.phase = "STABILIZING"
             if now - self.stable_since >= self.stable_duration:
                 self.phase = "PREPARING"
                 return None
         else:
-            self.stable_since = None
             self.phase = "STARTUP"
         return self.command_speed
 
@@ -154,7 +157,7 @@ class ExperimentNodeMixin:
             "manual_button": 4,
             "startup_speed": -1.0,
             "startup_acceleration": 0.5,
-            "startup_speed_tolerance": 0.05,
+            "startup_zero_speed_threshold": 0.1,
             "startup_stable_duration": 1.0,
             "startup_timeout": 0.0,
             "startup_boost_speed": 1.0,
@@ -177,7 +180,7 @@ class ExperimentNodeMixin:
         self.startup_gate = StartupGate(
             target_speed=target,
             acceleration=acceleration,
-            tolerance=float(values["startup_speed_tolerance"]),
+            zero_speed_threshold=float(values["startup_zero_speed_threshold"]),
             stable_duration=float(values["startup_stable_duration"]),
             startup_timeout=float(values["startup_timeout"]),
             max_step_time=2.0 * self.control_period,
@@ -216,10 +219,10 @@ class ExperimentNodeMixin:
             qos_profile_sensor_data,
         )
         self.get_logger().info(
-            "WAITING: hold RB to reach %.3f m/s and settle within +/-%.3f m/s "
-            "for %.1f s; the real scene is created afterward. Recording starts "
+            "WAITING: hold RB to reach %.3f m/s, then keep moving for %.1f s. "
+            "Only speed <= %.3f m/s resets the timer; the real scene is created afterward. Recording starts "
             "with the first published controller command."
-            % (target, self.startup_gate.tolerance, self.startup_gate.stable_duration)
+            % (target, self.startup_gate.stable_duration, self.startup_gate.zero_speed_threshold)
         )
         boost_limit = (
             "%.2f s" % self.startup_gate.boost_duration
@@ -274,7 +277,11 @@ class ExperimentNodeMixin:
         )
         phase = self.startup_gate.phase
         if phase != previous_phase:
-            self.get_logger().info("Experiment phase: " + phase)
+            self.get_logger().info(
+                "Experiment phase: %s; measured speed: %s m/s; target: %.3f m/s."
+                % (phase, "%.3f" % state[2] if valid_state else "unavailable",
+                   self.startup_gate.target_speed)
+            )
         if phase not in {"PREPARING", "RUNNING"}:
             self.finish_experiment(self.startup_gate.abort_reason or phase)
             self.publish_experiment_command(command or 0.0)

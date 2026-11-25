@@ -102,19 +102,48 @@ def test_requires_one_full_second_of_measured_speed_stability(experiment):
 def test_startup_never_commands_above_target_when_already_moving(experiment):
     gate = experiment.StartupGate(target_speed=0.6)
     assert gate.update(0.0, 1.0, True, True) == 0.6
-    assert gate.phase == "STARTUP"
+    assert gate.phase == "STABILIZING"
 
 
-def test_speed_outside_tolerance_restarts_stability_timer(experiment):
+def test_speed_fluctuations_away_from_target_do_not_reset_timer(experiment):
     gate = experiment.StartupGate(target_speed=0.6)
     gate.update(0.0, 0.6, True, True)
-    gate.update(1.0, 0.7, True, True)
-    assert gate.stable_since is None
-    gate.update(1.1, 0.6, True, True)
-    gate.update(2.09, 0.6, True, True)
-    assert gate.phase == "STABILIZING"
-    gate.update(2.11, 0.6, True, True)
+    for now, speed in [(0.2, 0.7), (0.4, 0.35), (0.7, 0.8), (0.99, 0.5)]:
+        gate.update(now, speed, True, True)
+        assert gate.stable_since == 0.0
+        assert gate.phase == "STABILIZING"
+    assert gate.update(1.0, 0.67, True, True) is None
     assert gate.phase == "PREPARING"
+
+
+@pytest.mark.parametrize("near_zero_speed", [0.0, 0.05, 0.1])
+def test_only_near_zero_speed_clears_timer_and_requires_target_again(experiment, near_zero_speed):
+    gate = experiment.StartupGate(target_speed=0.6)
+    gate.update(0.0, 0.6, True, True)
+    gate.update(0.4, near_zero_speed, True, True)
+    assert gate.stable_since is None
+    assert gate.phase == "STARTUP"
+    gate.update(0.5, 0.3, True, True)
+    assert gate.stable_since is None
+    gate.update(0.6, 0.6, True, True)
+    assert gate.stable_since == 0.6
+    gate.update(1.59, 0.3, True, True)
+    assert gate.phase == "STABILIZING"
+    gate.update(1.61, 0.3, True, True)
+    assert gate.phase == "PREPARING"
+
+
+def test_near_zero_threshold_can_be_configured(experiment):
+    gate = experiment.StartupGate(target_speed=0.6, zero_speed_threshold=0.2)
+    gate.update(0.0, 0.6, True, True)
+    gate.update(0.4, 0.15, True, True)
+    assert gate.stable_since is None
+
+
+@pytest.mark.parametrize("threshold", [-0.1, 0.6, float("nan"), float("inf")])
+def test_invalid_near_zero_threshold_is_rejected(experiment, threshold):
+    with pytest.raises(ValueError, match="startup_zero_speed_threshold"):
+        experiment.StartupGate(target_speed=0.6, zero_speed_threshold=threshold)
 
 
 def test_lost_feedback_aborts_running_experiment_until_rb_released(experiment):
@@ -357,7 +386,7 @@ def test_manual_run_up_waits_for_rb_and_settles_at_target_before_scene(
     else:
         assert node.commands[-1] == (0.6, 0.0)
         if manual_speed > 0.6:
-            assert node.startup_gate.stable_since is None
+            assert node.startup_gate.stable_since == 1.1
     node.tick(1.2, speed=0.6)
     stable_since = node.startup_gate.stable_since
     assert not node.tick(stable_since + 0.99, speed=0.6)
@@ -369,6 +398,25 @@ def test_manual_run_up_waits_for_rb_and_settles_at_target_before_scene(
     assert node.publish_valid_command()
     node.write_sample()
     assert node.run_logger.sample_index == 1
+    node.close_experiment()
+
+
+def test_scene_is_created_despite_speed_oscillation_after_reaching_target(node, tmp_path):
+    assert not node.tick(0.0, speed=0.0)
+    assert not node.tick(0.2, speed=0.6)
+    assert not node.tick(0.5, speed=0.75)
+    assert not node.tick(0.8, speed=0.4)
+    assert not node.tick(1.19, speed=0.7)
+    assert not node.scenarios
+    assert not list(tmp_path.glob("*.csv"))
+    assert node.tick(1.21, speed=0.67)
+    assert len(node.scenarios) == 1
+    np.testing.assert_allclose(node.scenarios[0][2], 0.67)
+    assert node.publish_valid_command()
+    node.write_sample()
+    with node.run_logger.path.open(newline="") as stream:
+        first = next(csv.DictReader(stream))
+    assert first["experiment_time_sec"] == "0.0"
     node.close_experiment()
 
 

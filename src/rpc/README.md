@@ -23,22 +23,27 @@ After warmup, hold RB to start vehicle startup. A car below its startup target g
 1.0 m/s breakaway command (matching full-forward joystick input), until measured
 speed reaches the startup target (0.6 m/s by default), with no default duration
 cutoff. On reaching the target, the command immediately returns to that speed
-and the one-second settling check begins. A car already at or above the target
+and the one-second motion-hold check begins. A car already at or above the target
 uses the normal speed ramp; boost is also skipped when its command is no higher
 than the startup target. Set `startup_boost_speed:=0.0` to disable the boost.
 `startup_boost_duration` and `startup_timeout` both default to 0.0 (disabled).
 Positive values enable optional duration cutoffs. RB release, LB takeover,
 and feedback timeouts still stop the autonomous command. A manual run-up is
 supported: hold LB through node startup, then release LB and hold RB. The node
-still waits for the requested initial speed to settle before creating a scene.
-The default startup speed follows `virtual_reference_speed`. Once the command
-reaches that target and measured speed remains within +/-0.05 m/s for 1.0
-consecutive seconds, the node creates the virtual road at the current vehicle
+still waits for the initial speed to be reached and the hold interval to finish.
+The default startup speed follows `virtual_reference_speed`. Once measured
+speed reaches or exceeds that target, the timer runs for 1.0 second. Only speed
+at or below `startup_zero_speed_threshold` (0.1 m/s by default) resets it;
+other speed fluctuations do not. A near-stop requires reaching the target again
+before restarting the timer. After the hold, the node creates the virtual road at the current vehicle
 pose and calculates its first controller command. The experiment clock starts
 only when that first command is successfully published. Its first CSV row has
 time zero; the file uses that publication timestamp. Scene preparation and
 first-command latency are recorded separately. No scenario or experiment samples
 are produced during the run-up.
+
+The motion-hold rule does not guarantee that the scene's initial speed exactly
+matches the requested speed. The CSV records the actual measured initial state.
 
 Release RB or press LB to close that experiment and reset. Another qualified
 RB hold starts a new scene and a new CSV in the same node process. Joystick

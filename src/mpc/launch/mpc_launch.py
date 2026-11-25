@@ -15,7 +15,7 @@ def generate_launch_description():
         'virtual_lane_change_delay': '2.0',
         'startup_speed': '-1.0',
         'startup_acceleration': '0.5',
-        'startup_speed_tolerance': '0.05',
+        'startup_zero_speed_threshold': '0.1',
         'startup_stable_duration': '1.0',
         'startup_timeout': '0.0',
         'startup_boost_speed': '1.0',
