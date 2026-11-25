@@ -19,7 +19,14 @@ CVXPY/OSQP 求解替换为训练好的 RPC/HFRPC 网络。网络每次输出一�
 
 On launch, the node first runs three synthetic inference/rollout passes without
 creating a real scene, publishing drive commands, or recording experiment data.
-After warmup, hold RB to start a straight speed-command ramp.
+After warmup, hold RB to start vehicle startup. A car below its startup target gets a bounded
+1.0 m/s breakaway command (matching full-forward joystick input), until measured
+speed reaches the startup target (0.6 m/s by default) or the one-second boost
+timeout expires. On reaching the target, the command immediately returns to
+that speed and the two-second settling check begins. A boost timeout stops the
+car and requires releasing RB before retrying. A car already at or above the target
+uses the normal speed ramp; boost is also skipped when its command is no higher
+than the startup target. Set `startup_boost_speed:=0.0` to disable the boost.
 The default startup speed follows `virtual_reference_speed`. Once the command
 reaches that target and measured speed remains within +/-0.05 m/s for 2.0
 consecutive seconds, the node creates the virtual road at the current vehicle

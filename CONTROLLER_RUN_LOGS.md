@@ -12,9 +12,17 @@ published controller command, after computational warmup and vehicle startup.
    and solves dummy optimization problems; RPC runs dummy inference and model
    rollouts. No real scene, drive commands, or experiment CSVs are produced by
    warmup. The node then waits in `WAITING`.
-2. Hold RB (button index 5). In `STARTUP`, the speed command ramps toward
-   `startup_speed` at `startup_acceleration`. Steering is held at zero. The ramp
-   accumulates the commanded speed even when the measured wheel speed is zero.
+2. Hold RB (button index 5). If measured speed is below the startup target and
+   `startup_boost_speed` exceeds the startup target, enter `BOOSTING`. Send a
+   1.0 m/s speed command by default, matching full-forward joystick input in this
+   repository's `joy_teleop.yaml` (axis scale 1.0), with zero steering. This is a
+   motor speed request, not a duty-cycle or current override. Once measured
+   speed reaches `startup_speed`, immediately return the command to that target
+   and begin the settling check. If the target speed is not reached
+   within `startup_boost_duration`, stop and latch `ABORTED`; release RB to retry.
+   Only one boost is issued per RB hold. If already at or above the target, with boost disabled,
+   or with a startup target at least as high as the boost, use the normal
+   `STARTUP` speed ramp at `startup_acceleration` instead. Steering remains zero.
 3. Once the command reaches the target and measured speed stays within
    `startup_speed_tolerance` of it, enter `STABILIZING`. Any excursion outside
    the tolerance resets the entire settling timer.
@@ -48,10 +56,14 @@ This timing definition describes software command publication, not physical
 motor response or acknowledgement by the mux. The scene origin is the measured
 pose used to compute the first command; it is not relocated after the solve.
 
-The speed ramp is not a motor breakaway boost: it never commands a speed above
-the selected startup target to overcome a stalled motor. An unreachable target
-aborts startup after `startup_timeout` (15.0 s by default). The vehicle needs a
-straight run-up area for acceleration and the speed-settling interval.
+The breakaway boost may exceed the experiment's initial speed, but is bounded
+by the vehicle speed limit and a separate duration limit. Its default command
+is 1.0 m/s for at most 1.0 s; it ends when measured speed reaches the configured
+startup target (0.6 m/s by default). There is no intermediate exit speed.
+Set `startup_boost_speed:=0.0` to disable it.
+After reaching the target, no automatic repeated pulses are issued if the car
+stalls again. An unreachable target still aborts after `startup_timeout`
+(15.0 s by default). The vehicle needs a straight run-up area.
 
 Fresh joystick and odometry messages are required. Losing either stream for
 more than 0.3 s aborts an active startup or experiment and sends a zero command.
@@ -79,7 +91,7 @@ RPC_20260809_154455_654321.csv
 ```
 
 Only `RUNNING` controller updates are written. Synthetic warmup, waiting,
-acceleration, settling, and preparation samples are excluded. Every row is
+boost, acceleration, settling, and preparation samples are excluded. Every row is
 flushed immediately. If the first solve, inference, or publication fails, the
 experiment aborts without opening a CSV. Failed MPC
 solves and failed RPC inferences during the experiment are also recorded with
@@ -152,6 +164,8 @@ Both launch files expose the same startup parameters:
 | `warmup_iterations` | `3` | Synthetic controller calculations before waiting for RB |
 | `startup_speed` | `-1.0` | Initial speed in m/s; -1 uses the tracking reference |
 | `startup_acceleration` | `0.5` | Speed-command ramp rate in m/s^2 |
+| `startup_boost_speed` | `1.0` | Breakaway speed command in m/s; 0 disables boost |
+| `startup_boost_duration` | `1.0` | Maximum single boost duration in s |
 | `startup_speed_tolerance` | `0.05` | Allowed measured-speed error in m/s |
 | `startup_stable_duration` | `2.0` | Required uninterrupted settling time in s |
 | `startup_timeout` | `15.0` | Maximum startup and settling duration in s |
@@ -184,6 +198,19 @@ ros2 launch rpc rpc_launch.py \
 ```
 
 Use `ros2 launch mpc mpc_launch.py` with the same arguments to run MPC instead.
+
+The default 0.6 m/s experiment now uses the bounded breakaway boost. Both nodes
+accept the same parameters:
+
+```bash
+ros2 launch rpc rpc_launch.py \
+  startup_boost_speed:=1.0 startup_boost_duration:=1.0 \
+  virtual_reference_speed:=0.6
+```
+
+The boost continues until the measured startup target is reached, subject to
+the duration limit. Boost does not change controller warmup, scenario generation, the
+two-second settling test, or the first-publication definition of time zero.
 
 Use a custom output directory:
 

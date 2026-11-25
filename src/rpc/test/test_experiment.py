@@ -25,6 +25,70 @@ def test_startup_ramp_accumulates_even_when_wheels_are_stopped(experiment):
     assert gate.phase == "STARTUP"
 
 
+def test_boost_matches_full_forward_command_then_returns_to_target(experiment):
+    gate = experiment.StartupGate(target_speed=0.6)
+    assert gate.update(0.0, 0.0, True, True) == 1.0
+    assert gate.phase == "BOOSTING"
+    assert gate.update(0.2, 0.0, True, True) == 1.0
+    assert gate.stable_since is None
+    assert gate.update(0.3, 0.21, True, True) == 1.0
+    assert gate.phase == "BOOSTING"
+    assert gate.stable_since is None
+    gate.update(0.4, 0.6, True, True)
+    assert gate.phase == "STABILIZING"
+    gate.update(2.39, 0.6, True, True)
+    assert gate.phase == "STABILIZING"
+    assert gate.update(2.41, 0.6, True, True) is None
+    assert gate.phase == "PREPARING"
+
+
+def test_boost_timeout_stops_and_does_not_retry_while_rb_is_held(experiment):
+    gate = experiment.StartupGate(target_speed=0.6)
+    gate.update(0.0, 0.0, True, True)
+    assert gate.update(0.99, 0.0, True, True) == 1.0
+    assert gate.update(1.0, 0.0, True, True) == 0.0
+    assert gate.phase == "ABORTED"
+    assert gate.abort_reason == "startup_boost_timeout"
+    assert gate.update(1.1, 0.0, True, True) == 0.0
+    gate.update(1.2, 0.0, False, True)
+    assert gate.update(1.3, 0.0, True, True) == 1.0
+
+
+@pytest.mark.parametrize("feedback_ok,enabled", [(False, True), (True, False)])
+def test_boost_is_cancelled_by_feedback_loss_or_rb_release(experiment, feedback_ok, enabled):
+    gate = experiment.StartupGate(target_speed=0.6)
+    gate.update(0.0, 0.0, True, True)
+    assert gate.update(0.1, 0.0, enabled, feedback_ok) == 0.0
+    assert gate.phase == ("ABORTED" if enabled else "WAITING")
+
+
+def test_moving_vehicle_below_target_keeps_boosting_until_target(experiment):
+    gate = experiment.StartupGate(target_speed=0.6)
+    assert gate.update(0.0, 0.3, True, True) == 1.0
+    assert gate.phase == "BOOSTING"
+    assert gate.update(0.1, 0.59, True, True) == 1.0
+    assert gate.stable_since is None
+    assert gate.update(0.2, 0.6, True, True) == 0.6
+    assert gate.phase == "STABILIZING"
+
+
+def test_boost_can_be_disabled_or_skipped_for_a_higher_target(experiment):
+    disabled = experiment.StartupGate(target_speed=0.6, boost_speed=0.0)
+    assert disabled.update(0.0, 0.0, True, True) == 0.0
+    assert disabled.update(0.1, 0.0, True, True) == pytest.approx(0.05)
+    higher_target = experiment.StartupGate(target_speed=1.2)
+    assert higher_target.update(0.0, 0.0, True, True) == 0.0
+    assert higher_target.phase == "STARTUP"
+
+
+def test_boost_is_not_repeated_when_speed_drops_after_breakaway(experiment):
+    gate = experiment.StartupGate(target_speed=0.6)
+    gate.update(0.0, 0.0, True, True)
+    gate.update(0.2, 0.6, True, True)
+    assert gate.update(0.4, 0.0, True, True) == 0.6
+    assert gate.phase == "STARTUP"
+
+
 def test_requires_two_full_seconds_of_measured_speed_stability(experiment):
     gate = experiment.StartupGate(target_speed=0.6)
     gate.update(0.0, 0.6, True, True)
@@ -204,6 +268,70 @@ def test_scenario_and_csv_start_only_after_settling_and_restart_per_hold(node, t
     assert node.run_logger.path != first_logger.path
     assert node.run_logger.sample_index == 1
     node.close_experiment()
+
+
+def test_boost_and_return_to_target_are_excluded_from_the_experiment(node, tmp_path):
+    assert not node.tick(0.0, speed=0.0)
+    assert node.startup_gate.phase == "BOOSTING"
+    assert node.commands[-1] == (1.0, 0.0)
+    assert not node.tick(0.1, speed=0.21)
+    assert node.commands[-1] == (1.0, 0.0)
+    assert node.startup_gate.phase == "BOOSTING"
+    assert not node.tick(0.2, speed=0.6)
+    assert node.startup_gate.phase == "STABILIZING"
+    assert not node.tick(2.19, speed=0.6)
+    assert not node.scenarios
+    assert not list(tmp_path.glob("*.csv"))
+    assert node.tick(2.21, speed=0.6)
+    assert node.experiment_start_time is None
+    assert node.publish_valid_command()
+    node.write_sample()
+    with node.run_logger.path.open(newline="") as stream:
+        rows = list(csv.DictReader(stream))
+    assert len(rows) == 1
+    assert rows[0]["phase"] == "RUNNING"
+    assert rows[0]["experiment_time_sec"] == "0.0"
+    node.close_experiment()
+
+
+def test_boost_and_settling_are_excluded_from_scene_and_experiment_log(node, tmp_path):
+    assert not node.tick(0.0, speed=0.0)
+    assert node.startup_gate.phase == "BOOSTING"
+    assert node.commands[-1] == (1.0, 0.0)
+    assert not node.tick(0.2, speed=0.21)
+    assert node.commands[-1] == (1.0, 0.0)
+    assert node.startup_gate.phase == "BOOSTING"
+    assert not node.tick(0.3, speed=0.6)
+    assert not node.tick(2.29, speed=0.6)
+    assert not node.scenarios
+    assert not list(tmp_path.glob("*.csv"))
+    assert node.tick(2.31, speed=0.6)
+    assert len(node.scenarios) == 1
+    assert node.experiment_start_time is None
+    node.complete_scene_preparation()
+    assert node.publish_valid_command()
+    node.write_sample()
+    with node.run_logger.path.open(newline="") as stream:
+        rows = list(csv.DictReader(stream))
+    assert len(rows) == 1
+    assert rows[0]["experiment_time_sec"] == "0.0"
+    assert rows[0]["phase"] == "RUNNING"
+    node.close_experiment()
+
+
+def test_boost_timeout_creates_no_scene_or_log(node, tmp_path):
+    node.tick(0.0, speed=0.0)
+    assert not node.tick(1.0, speed=0.0)
+    assert node.startup_gate.abort_reason == "startup_boost_timeout"
+    assert node.commands[-1] == (0.0, 0.0)
+    assert not node.scenarios
+    assert not list(tmp_path.glob("*.csv"))
+
+
+def test_boost_speed_cannot_exceed_the_vehicle_limit(node):
+    node.parameters["startup_boost_speed"] = 6.1
+    with pytest.raises(ValueError, match="vehicle speed limit"):
+        node.setup_experiment("RPC", 2, 6.0, 3.0)
 
 
 def test_lb_override_ends_logging_and_resets_settling(node):

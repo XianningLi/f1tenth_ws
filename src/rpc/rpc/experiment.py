@@ -27,7 +27,7 @@ def make_warmup_inputs(horizon, model_dt, speed):
 
 @dataclass
 class StartupGate:
-    """Ramp a speed command, then require continuous measured-speed settling."""
+    """Apply a bounded breakaway boost, then settle at the experiment speed."""
 
     target_speed: float
     acceleration: float = 0.5
@@ -35,14 +35,21 @@ class StartupGate:
     stable_duration: float = 2.0
     startup_timeout: float = 15.0
     max_step_time: float = 0.2
+    boost_speed: float = 1.0
+    boost_duration: float = 1.0
 
     def __post_init__(self):
         values = (
             self.target_speed, self.acceleration, self.tolerance,
             self.stable_duration, self.startup_timeout, self.max_step_time,
+            self.boost_duration,
         )
         if not all(math.isfinite(value) and value > 0.0 for value in values):
             raise ValueError("Startup parameters must be finite and positive")
+        if not math.isfinite(self.boost_speed) or self.boost_speed < 0.0:
+            raise ValueError("startup_boost_speed must be finite and nonnegative")
+        if self.boost_speed > 0.0 and self.boost_duration >= self.startup_timeout:
+            raise ValueError("startup_boost_duration must be shorter than startup_timeout")
         if self.tolerance >= self.target_speed:
             raise ValueError("startup_speed_tolerance must be smaller than startup_speed")
         if self.startup_timeout <= self.stable_duration:
@@ -56,6 +63,7 @@ class StartupGate:
         self.stable_since = None
         self.last_tick = None
         self.abort_reason = None
+        self.boost_started_at = None
 
     def abort(self, reason):
         self.phase = "ABORTED"
@@ -80,9 +88,29 @@ class StartupGate:
             self.started_at = now
             self.last_tick = now
             self.command_speed = min(self.target_speed, max(0.0, speed))
+            if (
+                self.boost_speed > self.target_speed
+                and speed < self.target_speed
+            ):
+                self.phase = "BOOSTING"
+                self.boost_started_at = now
         if now - self.started_at >= self.startup_timeout:
             self.abort("startup_timeout")
             return 0.0
+
+        if self.phase == "BOOSTING":
+            if speed >= self.target_speed:
+                # Hold the experiment speed only after measured speed reaches it.
+                self.command_speed = self.target_speed
+                self.last_tick = now
+                self.phase = "STARTUP"
+            elif now - self.boost_started_at >= self.boost_duration:
+                self.abort("startup_boost_timeout")
+                return 0.0
+            else:
+                self.command_speed = self.boost_speed
+                self.stable_since = None
+                return self.command_speed
 
         dt = min(max(now - self.last_tick, 0.0), self.max_step_time)
         self.last_tick = now
@@ -121,6 +149,8 @@ class ExperimentNodeMixin:
             "startup_speed_tolerance": 0.05,
             "startup_stable_duration": 2.0,
             "startup_timeout": 15.0,
+            "startup_boost_speed": 1.0,
+            "startup_boost_duration": 1.0,
             "joy_timeout": 0.3,
             "odometry_timeout": 0.3,
         }
@@ -131,8 +161,11 @@ class ExperimentNodeMixin:
         if target == -1.0:
             target = float(self.virtual_reference_speed)
         acceleration = float(values["startup_acceleration"])
+        boost_speed = float(values["startup_boost_speed"])
         if not 0.0 < target <= max_speed or not 0.0 < acceleration <= max_accel:
             raise ValueError("Startup speed or acceleration exceeds vehicle limits")
+        if not math.isfinite(boost_speed) or not 0.0 <= boost_speed <= max_speed:
+            raise ValueError("startup_boost_speed must be between 0 and the vehicle speed limit")
         self.startup_gate = StartupGate(
             target_speed=target,
             acceleration=acceleration,
@@ -140,6 +173,8 @@ class ExperimentNodeMixin:
             stable_duration=float(values["startup_stable_duration"]),
             startup_timeout=float(values["startup_timeout"]),
             max_step_time=2.0 * self.control_period,
+            boost_speed=boost_speed,
+            boost_duration=float(values["startup_boost_duration"]),
         )
         self._autonomous_button = int(values["autonomous_button"])
         self._manual_button = int(values["manual_button"])
@@ -177,6 +212,13 @@ class ExperimentNodeMixin:
             "for %.1f s; the real scene is created afterward. Recording starts "
             "with the first published controller command."
             % (target, self.startup_gate.tolerance, self.startup_gate.stable_duration)
+        )
+        self.get_logger().info(
+            "Startup boost: %.3f m/s until measured speed reaches target %.3f m/s "
+            "(at most %.2f s). Set startup_boost_speed=0 to disable."
+            % (
+                self.startup_gate.boost_speed, target, self.startup_gate.boost_duration,
+            )
         )
 
     def experiment_joy_callback(self, message):
