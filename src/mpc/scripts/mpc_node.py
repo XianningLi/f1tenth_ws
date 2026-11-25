@@ -23,7 +23,8 @@ from scipy.spatial.transform import Rotation
 from visualization_msgs.msg import Marker
 from visualization_msgs.msg import MarkerArray
 import time
-from mpc.run_logger import RunCsvLogger, default_log_directory
+from mpc.experiment import ExperimentNodeMixin, make_warmup_inputs
+from mpc.run_logger import default_log_directory
 
 @dataclass
 class mpc_config:
@@ -72,7 +73,7 @@ class State:
     yawrate: float = 0.0
     beta: float = 0.0
 
-class MPC(Node):
+class MPC(ExperimentNodeMixin, Node):
     """ 
     Implement Kinematic MPC on the car
     This is just a template, you are free to implement your own node!
@@ -91,6 +92,7 @@ class MPC(Node):
         self.declare_parameter('virtual_reference_speed', 0.6)
         self.declare_parameter('virtual_lane_change_delay', 2.0)
         self.declare_parameter('control_period', 0.1)
+        self.declare_parameter('warmup_iterations', 3)
         self.declare_parameter('save_run_data', True)
         self.declare_parameter('log_directory', default_log_directory())
 
@@ -115,6 +117,9 @@ class MPC(Node):
         self.waypoints = None
         if not self.virtual_road_mode:
             self.waypoints = self.load_waypoints(self.waypoint_path)
+        self.mpc_prob_init()
+        self.last_solver_time_ms = None
+        self.warmup_controller()
         self.drive_pub_ = self.create_publisher(AckermannDriveStamped, '/drive', 10)
         self.drive_msg_ = AckermannDriveStamped()
 
@@ -137,25 +142,43 @@ class MPC(Node):
         self.oa = None
         self.init_flag = 0
 
-        # initialize MPC problem
-        self.mpc_prob_init()
-        self.last_solver_time_ms = None
-        self.run_logger = None
-        if bool(self.get_parameter('save_run_data').value):
-            self.run_logger = RunCsvLogger(
-                self.get_parameter('log_directory').value,
-                'MPC',
-                self.config.TK,
-            )
-            self.get_logger().info(f'Run data: {self.run_logger.path}')
-
         # visualize goal points
         self.ref_goal_points_data = None
         if not self.virtual_road_mode:
             self.ref_goal_points_data = self.viz_ref_points()
+        self._experiment_drive_publisher = self.drive_pub_
+        self._experiment_marker_publishers = [
+            self.ref_trajectory_, self.opt_trajectory_, self.ref_target_point_,
+        ]
+        self._experiment_array_publishers = [
+            self.virtual_road_, self.ref_goal_points_,
+        ]
+        self.setup_experiment('MPC', self.config.TK, self.config.MAX_SPEED, self.config.MAX_ACCEL)
+        self.clear_experiment_markers()
         self.control_timer = self.create_timer(self.control_period, self.control_callback)
 
     
+    def warmup_controller(self):
+        """Compile and solve synthetic MPC problems without sending commands."""
+        iterations = int(self.get_parameter('warmup_iterations').value)
+        if iterations < 1:
+            raise ValueError('warmup_iterations must be at least 1')
+        state, reference = make_warmup_inputs(
+            self.config.TK, self.config.DTK,
+            min(self.config.MAX_SPEED, max(0.1, self.virtual_reference_speed)),
+        )
+        start_ns = time.perf_counter_ns()
+        self.get_logger().info('WARMUP: using synthetic inputs; no commands or experiment data.')
+        acceleration, steering = None, None
+        for _ in range(iterations):
+            result = self.linear_mpc_control(reference, state, acceleration, steering)
+            if any(value is None or not np.isfinite(value).all() for value in result[:6]):
+                raise RuntimeError('MPC warmup failed to produce a finite solution')
+            acceleration, steering = result[:2]
+        self.last_solver_time_ms = None
+        self.warmup_time_ms = (time.perf_counter_ns() - start_ns) / 1.0e6
+        self.get_logger().info('MPC warmup complete: %.3f ms.' % self.warmup_time_ms)
+
     def load_waypoints(self, path):
         points = np.loadtxt(path, delimiter=';',skiprows=3, dtype=np.float64)
         #  points = np.loadtxt(path, delimiter=';', skiprows=3)
@@ -176,7 +199,7 @@ class MPC(Node):
             [-math.sin(self.virtual_yaw), math.cos(self.virtual_yaw)],
             dtype=np.float64,
         )
-        self.virtual_start_time = time.time()
+        self.virtual_start_time = self.experiment_start_time
         self.virtual_road_initialized = True
         self.get_logger().info(
             f'Virtual road initialized at x={state.x:.2f}, y={state.y:.2f}, yaw={state.yaw:.2f}'
@@ -195,7 +218,7 @@ class MPC(Node):
         current_position = np.array([state.x, state.y], dtype=np.float64)
         current_s = float(np.dot(current_position - self.virtual_origin, self.virtual_forward))
         current_s = max(0.0, current_s)
-        elapsed = time.time() - self.virtual_start_time
+        elapsed = self.experiment_reference_time
         target_offset = 0.0
         if elapsed >= self.virtual_lane_change_delay:
             target_offset = self.virtual_lane_width
@@ -213,9 +236,17 @@ class MPC(Node):
 
     def pose_callback(self, pose_msg):
         self.latest_odom_msg = pose_msg
+        self.note_experiment_odometry()
+
+    def start_experiment_scenario(self, state):
+        self.oa = None
+        self.odelta_v = None
+        if self.virtual_road_mode:
+            self.init_virtual_road(State(x=state[0], y=state[1], v=state[2], yaw=state[3]))
 
     def control_callback(self):
         if self.latest_odom_msg is None:
+            self.prepare_experiment(None)
             return
 
         pose_msg = self.latest_odom_msg
@@ -236,13 +267,11 @@ class MPC(Node):
         yaw_state = math.atan2(2 * (q[3] * q[2] + q[0] * q[1]), 1 - 2 * (q[1] ** 2 + q[2] ** 2))
         # print("current yaw", yawp)
         vehicle_state = State(x = x_state, y = y_state, v = vel_state, yaw = yaw_state)
+        if not self.prepare_experiment(np.array([x_state, y_state, vel_state, yaw_state])):
+            return
 
         if self.virtual_road_mode:
-            if not self.virtual_road_initialized:
-                self.init_virtual_road(vehicle_state)
             ref_path = self.calc_virtual_ref_trajectory(vehicle_state)
-            self.viz_virtual_road()
-            self.viz_ref_target(ref_path)
         else:
             ref_x = self.waypoints[:, 1]
             ref_y = self.waypoints[:, 2]
@@ -253,7 +282,7 @@ class MPC(Node):
             #       ref_x, ref_y, ref_yaw, ref_v are columns of self.waypoints
             ref_path = self.calc_ref_trajectory( vehicle_state, ref_x, ref_y, ref_yaw, ref_v)
 
-        self.viz_rej_traj(ref_traj=ref_path)
+        self.complete_scene_preparation()
         #print(ref_path.shape)
         x0 = [vehicle_state.x, vehicle_state.y, vehicle_state.v, vehicle_state.yaw]
 
@@ -294,6 +323,7 @@ class MPC(Node):
                 command_speed=None,
             )
             self.get_logger().error(f'MPC solve raised an exception: {exc}')
+            self.abort_experiment('solve_exception')
             return
         controller_compute_ms = (
             time.perf_counter_ns() - controller_start_ns
@@ -320,6 +350,7 @@ class MPC(Node):
                 command_speed=None,
             )
             self.get_logger().warn('MPC solve failed; skipping drive command.')
+            self.abort_experiment('solve_failed')
             return
         
         # print("reference yaw", ref_path[2, :])
@@ -328,7 +359,6 @@ class MPC(Node):
         # print(state_predict.shape)
         opt_traj = np.vstack((ox, oy, ov, oyaw))
         opt_controls = np.vstack((self.oa, self.odelta_v))
-        self.viz_opt_traj(opt_traj)
         # TODO: publish drive message.
         steer_output = float(self.odelta_v[0])
         speed_output = float(np.clip(vehicle_state.v + self.oa[0] * self.config.DTK, self.config.MIN_SPEED, self.config.MAX_SPEED))
@@ -336,7 +366,13 @@ class MPC(Node):
         
         self.drive_msg_.drive.speed = speed_output
         self.drive_msg_.drive.steering_angle = steer_output
-        self.drive_pub_.publish(self.drive_msg_)
+        if not self.publish_controller_command(self.drive_msg_):
+            return
+        if self.virtual_road_mode:
+            self.viz_virtual_road()
+            self.viz_ref_target(ref_path)
+        self.viz_rej_traj(ref_traj=ref_path)
+        self.viz_opt_traj(opt_traj)
         if self.ref_goal_points_data is not None:
             self.ref_goal_points_.publish(self.ref_goal_points_data)
         callback_total_ms = (
@@ -371,18 +407,6 @@ class MPC(Node):
                 speed_output,
             )
         )
-
-    def write_run_log(self, **sample):
-        if self.run_logger is None:
-            return
-        try:
-            sample['ros_time_sec'] = self.get_clock().now().nanoseconds / 1.0e9
-            self.run_logger.log(**sample)
-        except Exception as exc:
-            self.get_logger().error(f'Disabling run data logging after error: {exc}')
-            self.run_logger.close()
-            self.run_logger = None
-
 
     def mpc_prob_init(self):
         """
@@ -868,8 +892,7 @@ class MPC(Node):
         self.opt_trajectory_.publish(traj)
 
     def destroy_node(self):
-        if self.run_logger is not None:
-            self.run_logger.close()
+        self.close_experiment()
         return super().destroy_node()
 
 
@@ -878,11 +901,14 @@ def main(args=None):
 
     rclpy.init(args=args)
     print("MPC Initialized")
-    mpc_node = MPC()
-    rclpy.spin(mpc_node)
-
-    mpc_node.destroy_node()
-    rclpy.shutdown()
+    mpc_node = None
+    try:
+        mpc_node = MPC()
+        rclpy.spin(mpc_node)
+    finally:
+        if mpc_node is not None:
+            mpc_node.destroy_node()
+        rclpy.shutdown()
 
 if __name__ == '__main__':
     main()

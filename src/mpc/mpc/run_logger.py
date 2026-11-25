@@ -1,4 +1,4 @@
-"""Per-process CSV logging for controller timing and trajectories."""
+"""Per-experiment CSV logging for controller timing and trajectories."""
 
 from __future__ import annotations
 
@@ -19,6 +19,8 @@ TIMING_NAMES = (
     "control_inference_ms",
     "prediction_rollout_ms",
     "callback_total_ms",
+    "scene_preparation_ms",
+    "first_command_latency_ms",
 )
 
 
@@ -32,12 +34,15 @@ def default_log_directory() -> str:
 class RunCsvLogger:
     """Write one flushed CSV row per controller update."""
 
-    def __init__(self, directory: str | Path, prefix: str, horizon: int) -> None:
+    def __init__(
+        self, directory: str | Path, prefix: str, horizon: int,
+        *, started_at: datetime | None = None,
+    ) -> None:
         if horizon < 1:
             raise ValueError("horizon must be positive")
         output_directory = Path(directory).expanduser()
         output_directory.mkdir(parents=True, exist_ok=True)
-        timestamp = datetime.now().astimezone().strftime("%Y%m%d_%H%M%S_%f")
+        timestamp = (started_at or datetime.now().astimezone()).strftime("%Y%m%d_%H%M%S_%f")
         self.path = output_directory / f"{prefix}_{timestamp}.csv"
         self.horizon = horizon
         self.sample_index = 0
@@ -47,7 +52,10 @@ class RunCsvLogger:
         self._file.flush()
 
     def _header(self) -> list[str]:
-        header = ["sample", "wall_time_iso", "ros_time_sec", "status"]
+        header = [
+            "sample", "wall_time_iso", "ros_time_sec", "status",
+            "phase", "experiment_time_sec", "reference_time_sec",
+        ]
         header.extend(TIMING_NAMES)
         header.extend(f"state_{name}" for name in STATE_NAMES)
         header.extend(
@@ -103,12 +111,19 @@ class RunCsvLogger:
         command_acceleration: float | None,
         command_steering: float | None,
         command_speed: float | None,
+        phase: str = "RUNNING",
+        experiment_time_sec: float | None = None,
+        reference_time_sec: float | None = None,
+        wall_time_iso: str | None = None,
     ) -> None:
         row: list[float | int | str] = [
             self.sample_index,
-            datetime.now().astimezone().isoformat(timespec="milliseconds"),
+            wall_time_iso or datetime.now().astimezone().isoformat(timespec="milliseconds"),
             ros_time_sec,
             status,
+            phase,
+            "" if experiment_time_sec is None else float(experiment_time_sec),
+            "" if reference_time_sec is None else float(reference_time_sec),
         ]
         row.extend(
             "" if timings.get(name) is None else float(timings[name])

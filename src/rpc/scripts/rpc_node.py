@@ -16,12 +16,13 @@ from rclpy.node import Node
 from visualization_msgs.msg import Marker, MarkerArray
 
 from rpc.dynamics import clip_control, make_tracking_features, rollout_policy
+from rpc.experiment import ExperimentNodeMixin, make_warmup_inputs
 from rpc.neural_controller import NeuralController
-from rpc.run_logger import RunCsvLogger, default_log_directory
+from rpc.run_logger import default_log_directory
 from rpc.trajectory import load_waypoints, waypoint_reference_trajectory
 
 
-class RPC(Node):
+class RPC(ExperimentNodeMixin, Node):
     """Drop-in neural counterpart to the existing MPC tracker node."""
 
     def __init__(self) -> None:
@@ -42,6 +43,7 @@ class RPC(Node):
         self.declare_parameter("virtual_reference_speed", 0.6)
         self.declare_parameter("virtual_lane_change_delay", 2.0)
         self.declare_parameter("control_period", 0.1)
+        self.declare_parameter("warmup_iterations", 3)
         self.declare_parameter("odom_topic", "/pf/pose/odom")
         self.declare_parameter("drive_topic", "/drive")
         self.declare_parameter("visualization_frame", "map")
@@ -82,19 +84,11 @@ class RPC(Node):
                 self.controller.device,
             )
         )
+        self.warmup_controller()
 
         self.waypoints = None
         if not self.virtual_road_mode:
             self.waypoints, _ = load_waypoints(self.waypoint_path)
-
-        self.run_logger = None
-        if bool(self.get_parameter("save_run_data").value):
-            self.run_logger = RunCsvLogger(
-                self.get_parameter("log_directory").value,
-                "RPC",
-                self.controller.horizon,
-            )
-            self.get_logger().info(f"Run data: {self.run_logger.path}")
 
         drive_topic = self.get_parameter("drive_topic").value
         odom_topic = self.get_parameter("odom_topic").value
@@ -129,25 +123,69 @@ class RPC(Node):
         self.reference_points = (
             None if self.virtual_road_mode else self.make_reference_point_markers()
         )
+        self._experiment_drive_publisher = self.drive_publisher
+        self._experiment_marker_publishers = [
+            self.reference_trajectory_publisher,
+            self.predicted_trajectory_publisher,
+            self.reference_target_publisher,
+        ]
+        self._experiment_array_publishers = [
+            self.virtual_road_publisher, self.reference_points_publisher,
+        ]
+        self.setup_experiment(
+            "RPC", self.controller.horizon,
+            self.controller.vehicle.max_speed, self.controller.vehicle.max_accel,
+        )
+        self.clear_experiment_markers()
         self.control_timer = self.create_timer(
             self.control_period, self.control_callback
         )
 
+    def warmup_controller(self) -> None:
+        """Exercise inference and rollout before any drive publisher is created."""
+        iterations = int(self.get_parameter("warmup_iterations").value)
+        if iterations < 1:
+            raise ValueError("warmup_iterations must be at least 1")
+        state, reference = make_warmup_inputs(
+            self.controller.horizon, self.controller.model_dt,
+            min(self.controller.vehicle.max_speed, max(0.1, self.virtual_reference_speed)),
+        )
+        start_ns = time.perf_counter_ns()
+        self.get_logger().info("WARMUP: using synthetic inputs; no commands or experiment data.")
+        for _ in range(iterations):
+            first_control = clip_control(
+                self.controller.act(make_tracking_features(state, reference[:, 0])),
+                self.controller.vehicle,
+            )
+            states, controls = rollout_policy(
+                self.controller, state, reference,
+                self.controller.model_dt, self.controller.vehicle,
+                first_control=first_control,
+            )
+            if not np.isfinite(states).all() or not np.isfinite(controls).all():
+                raise RuntimeError("RPC warmup produced non-finite predictions")
+        self.warmup_time_ms = (time.perf_counter_ns() - start_ns) / 1.0e6
+        self.get_logger().info("RPC warmup complete: %.3f ms." % self.warmup_time_ms)
+
     def pose_callback(self, message: Odometry) -> None:
         self.latest_odometry = message
+        self.note_experiment_odometry()
+
+    def start_experiment_scenario(self, state: np.ndarray) -> None:
+        if self.virtual_road_mode:
+            self.initialize_virtual_road(state)
 
     def control_callback(self) -> None:
         if self.latest_odometry is None:
+            self.prepare_experiment(None)
             return
         callback_start_ns = time.perf_counter_ns()
         state = self.state_from_odometry(self.latest_odometry)
+        if not self.prepare_experiment(state):
+            return
 
         if self.virtual_road_mode:
-            if self.virtual_origin is None:
-                self.initialize_virtual_road(state)
             reference = self.virtual_reference_trajectory(state)
-            self.publish_virtual_road()
-            self.publish_reference_target(reference)
         else:
             reference = waypoint_reference_trajectory(
                 state,
@@ -155,6 +193,7 @@ class RPC(Node):
                 self.controller.horizon,
                 self.waypoint_index_step,
             )
+        self.complete_scene_preparation()
 
         controller_start_ns = time.perf_counter_ns()
         control_inference_ms = None
@@ -209,6 +248,7 @@ class RPC(Node):
                 command_speed=None,
             )
             self.get_logger().error(f"RPC inference failed; skipping command: {exc}")
+            self.abort_experiment("inference_failed")
             return
 
         controller_compute_ms = (
@@ -226,11 +266,14 @@ class RPC(Node):
         )
 
         command = AckermannDriveStamped()
-        command.header.stamp = self.get_clock().now().to_msg()
         command.drive.speed = speed_command
         command.drive.steering_angle = steering
-        self.drive_publisher.publish(command)
+        if not self.publish_controller_command(command):
+            return
 
+        if self.virtual_road_mode:
+            self.publish_virtual_road()
+            self.publish_reference_target(reference)
         self.publish_trajectory(reference, self.reference_trajectory_publisher, False)
         self.publish_trajectory(
             predicted_states, self.predicted_trajectory_publisher, True
@@ -270,17 +313,6 @@ class RPC(Node):
             )
         )
 
-    def write_run_log(self, **sample) -> None:
-        if self.run_logger is None:
-            return
-        try:
-            sample["ros_time_sec"] = self.get_clock().now().nanoseconds / 1.0e9
-            self.run_logger.log(**sample)
-        except Exception as exc:
-            self.get_logger().error(f"Disabling run data logging after error: {exc}")
-            self.run_logger.close()
-            self.run_logger = None
-
     @staticmethod
     def state_from_odometry(message: Odometry) -> np.ndarray:
         orientation = message.pose.pose.orientation
@@ -316,7 +348,7 @@ class RPC(Node):
         self.virtual_left = np.array(
             [-math.sin(self.virtual_yaw), math.cos(self.virtual_yaw)], dtype=float
         )
-        self.virtual_start_time = self.get_clock().now().nanoseconds * 1.0e-9
+        self.virtual_start_time = self.experiment_start_time
         self.get_logger().info(
             "Virtual road initialized at x=%.2f, y=%.2f, yaw=%.2f"
             % (state[0], state[1], state[3])
@@ -336,8 +368,7 @@ class RPC(Node):
             np.dot(state[:2] - self.virtual_origin, self.virtual_forward)
         )
         current_distance = max(0.0, current_distance)
-        current_time = self.get_clock().now().nanoseconds * 1.0e-9
-        elapsed = current_time - self.virtual_start_time
+        elapsed = self.experiment_reference_time
         target_offset = (
             self.virtual_lane_width
             if elapsed >= self.virtual_lane_change_delay
@@ -486,8 +517,7 @@ class RPC(Node):
         return markers
 
     def destroy_node(self):
-        if self.run_logger is not None:
-            self.run_logger.close()
+        self.close_experiment()
         return super().destroy_node()
 
 

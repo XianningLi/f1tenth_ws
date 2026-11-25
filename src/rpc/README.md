@@ -15,6 +15,37 @@ CVXPY/OSQP 求解替换为训练好的 RPC/HFRPC 网络。网络每次输出一�
 `rpc` 模型。默认参数为 8 步预测、模型步长 0.2 s、控制周期 0.1 s、轴距
 0.33 m，并从 checkpoint 读取这些模型参数和执行器限制。
 
+## RB-gated experiment startup
+
+On launch, the node first runs three synthetic inference/rollout passes without
+creating a real scene, publishing drive commands, or recording experiment data.
+After warmup, hold RB to start a straight speed-command ramp.
+The default startup speed follows `virtual_reference_speed`. Once the command
+reaches that target and measured speed remains within +/-0.05 m/s for 2.0
+consecutive seconds, the node creates the virtual road at the current vehicle
+pose and calculates its first controller command. The experiment clock starts
+only when that first command is successfully published. Its first CSV row has
+time zero; the file uses that publication timestamp. Scene preparation and
+first-command latency are recorded separately. No scenario or experiment samples
+are produced during the run-up.
+
+Release RB or press LB to close that experiment and reset. Another qualified
+RB hold starts a new scene and a new CSV in the same node process. Joystick
+and odometry must remain fresh; feedback loss aborts the run. The node now
+subscribes to `/joy` as well as `/pf/pose/odom`.
+
+```bash
+ros2 launch rpc rpc_launch.py \
+  virtual_reference_speed:=1.0 \
+  startup_stable_duration:=2.0
+```
+
+Set `startup_speed` separately if the scenario initial speed should differ
+from its tracking target. The lane-change delay starts at the first publication;
+its existing default is 2.0 s. Startup steering is zero, so a straight run-up
+area is required. See `CONTROLLER_RUN_LOGS.md` at the workspace root for the
+complete workflow, parameters, timing definitions, and CSV lifecycle.
+
 ## 构建与启动
 
 运行环境除 ROS 2 依赖外还需要 NumPy 和 PyTorch。PyTorch 的版本应与目标
